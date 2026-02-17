@@ -9,6 +9,91 @@ from argparse import ArgumentParser
 import requests
 from flask import Flask, jsonify, request
 
+def ip_to_int(ip_str):
+    """Converte o ip em um inteiro de 32 bits"""
+    parts = list(map(int, ip_str.split('.')))
+    return (parts[0] << 24) + (parts[1] << 16) + (parts[2] << 8) + parts[3]
+    
+def int_to_ip(ip_int):
+    """Faz o caminho inverso, converte de inteiro para ip"""
+    return f"{(ip_int >> 24) & 255}.{(ip_int >> 16) & 255}.{(ip_int >> 8) & 255}.{ip_int & 255}"
+
+def parse_network(network_str):
+    """Separa o ip em endereço e máscara"""
+    ip_part, prefix = network_str.split('/')
+    return ip_to_int(ip_part), int(prefix)
+
+def can_summarize(net1_str, net2_str):
+    """Verifica se duas redes são vizinhas e podem virar uma rede maior"""
+    ip1, pref1 = parse_network(net1_str)
+    ip2, pref2 = parse_network(net2_str)
+
+    # Verifia se as máscaras são iguais
+    if pref1 != pref2:
+        return False, None
+    
+    # Se o início de uma rede e o broadcast da outra forem contínuos, elas estão coladas 
+    mask = ((1 << 32) - 1) << (32 - pref1)
+    base1 = ip1 & mask
+    base2 = ip2 & mask
+
+    if abs(base1 - base2) == (1 << (32 - pref1)):
+        new_prefix = pref1 - 1
+        new_base = min(base1, base2)
+        return True, f"{int_to_ip(new_base)}/{new_prefix}"
+    
+    return False, None
+
+def summarize_routing_table(table):
+    """Sumariza as rotas da tabela"""
+
+    # Nada pra sumarizar
+    if len(table) < 2:
+        return table
+    
+    summary = table.copy()
+
+    """Só sumariza rotas que vão para o mesmo vizinho"""
+    by_neighbor = {}
+    for net, info in summary.items():
+        if '/' not in net:
+            continue
+
+        hop = info['next_hop']
+        if hop not in by_neighbor:
+            by_neighbor[hop] = []
+        by_neighbor[hop].append(net)
+
+    for hop, nets in by_neighbor.items():
+        nets.sort(key=lambda x: parse_network(x)[0])
+
+        i = 0
+        while i < len(nets) - 1:
+            net1, net2 = nets[i], nets[i+1]
+            # Verifica se é possível sumarizar
+            can_merge, new_net = can_summarize(net1, net2)
+
+            if can_merge:
+                new_cost = max(summary[net1]['cost'], summary[net2]['cost'])
+
+                # Removemos as duas redes que foram 'fundidas'
+                if net1 in summary: del summary[net1]
+                if net2 in summary: del summary[net2]
+
+                # Adicionamos a nova super rrede
+                summary[new_net] = {'cost': new_cost, 'next_hop': hop}
+
+                print(f"--- Sucesso: {net1} + {net2} viraram {new_net} ---")
+
+                nets.pop(i) # Remove ne1
+                nets.pop(i) # Remove net2
+                nets.insert(i, new_net)
+        
+            else:
+                i+=1
+
+    return summary
+
 class Router:
     """
     Representa um roteador que executa o algoritmo de Vetor de Distância.
@@ -74,26 +159,19 @@ class Router:
             try:
                 self.send_updates_to_neighbors()
             except Exception as e:
-                print(f"Erro durante a atualização periódida: {e}")
-
+                print(f"Erro durante a atualização periódida: {e}")    
+    
     def send_updates_to_neighbors(self):
         """
         Envia a tabela de roteamento (potencialmente sumarizada) para todos os vizinhos.
         """
-        # TODO: O código abaixo envia a tabela de roteamento *diretamente*.
-        #
-        # ESTE TRECHO DEVE SER CHAMAADO APOS A SUMARIZAÇÃO.
-        #
-        # dica:
-        # 1. CRIE UMA CÓPIA da `self.routing_table` NÃO ALTERE ESTA VALOR.
-        # 2. IMPLEMENTE A LÓGICA DE SUMARIZAÇÃO nesta cópia.
-        # 3. ENVIE A CÓPIA SUMARIZADA no payload, em vez da tabela original.
         
-        tabela_para_enviar = self.routing_table # ATENÇÃO: Substitua pela cópia sumarizada.
+        tabela_para_enviar = summarize_routing_table(self.routing_table)
+        self.routing_table = tabela_para_enviar
 
         payload = {
             "sender_address": self.my_address,
-            "routing_table": tabela_para_enviar
+            "routing_table": self.routing_table
         }
 
         for neighbor_address in self.neighbors:
