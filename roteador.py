@@ -9,6 +9,8 @@ from argparse import ArgumentParser
 import requests
 from flask import Flask, jsonify, request
 
+INFINITY = 16
+
 def ip_to_int(ip_str):
     """Converte o ip em um inteiro de 32 bits"""
     parts = list(map(int, ip_str.split('.')))
@@ -81,7 +83,7 @@ def summarize_routing_table(table):
                 if net2 in summary: del summary[net2]
 
                 # Adicionamos a nova super rrede
-                summary[new_net] = {'cost': new_cost, 'next_hop': hop}
+                summary[new_net] = {'cost': new_cost, 'next_hop': hop, 'timestamp': time.time()}
 
                 print(f"--- Sucesso: {net1} + {net2} viraram {new_net} ---")
 
@@ -116,13 +118,13 @@ class Router:
         self.update_interval = update_interval
 
         self.routing_table = {
-            self.my_network: {'cost': 0, 'next_hop': self.my_address}
+            self.my_network: {'cost': 0, 'next_hop': self.my_address, 'timestamp': time.time()}
         }
 
         # Adiciona vizinhos diretos conhecidos pelo arquivo CSV
         for neighbor, cost in self.neighbors.items():
             if neighbor not in self.routing_table:
-                self.routing_table[neighbor] = {'cost': cost, 'next_hop': neighbor}
+                self.routing_table[neighbor] = {'cost': cost, 'next_hop': neighbor, 'timestamp': time.time()}
 
         print("Tabela de roteamento inicial:")
         print(json.dumps(self.routing_table, indent=4))
@@ -144,13 +146,42 @@ class Router:
             try:
                 self.send_updates_to_neighbors()
             except Exception as e:
-                print(f"Erro durante a atualização periódida: {e}")    
+                print(f"Erro durante a atualização periódida: {e}") 
+
+    def _check_timeouts(self):
+        TIMEOUT = self.update_interval * 4
+
+        while True:
+            time.sleep(1)
+            now = time.time()
+            changed = False
+
+            for dest in list(self.routing_table.keys()):
+
+                if dest == self.my_network:
+                    continue
+
+                ts = self.routing_table[dest].get("timestamp")
+                if ts is None:
+                    continue
+
+                if now - ts > TIMEOUT:
+                    if self.routing_table[dest]["cost"] != INFINITY:
+                        print(f"Timeout: {dest} ficou inalcançável")
+                        self.routing_table[dest]["cost"] = INFINITY
+                        changed = True
+
+            if changed:
+                print("Tabela após timeout:")
+                print(json.dumps(self.routing_table, indent=4))
+   
     
     def send_updates_to_neighbors(self):
         """
-        Envia a tabela de roteamento (potencialmente sumarizada) para todos os vizinhos.
+        Envia a tabela de roteamento para todos os vizinhos
+        com Split Horizon + Poison Reverse.
         """
-        
+    
         for neighbor_address in self.neighbors:
 
             tabela_para_enviar = summarize_routing_table(
@@ -160,7 +191,15 @@ class Router:
             tabela_filtrada = {}
 
             for dest, info in tabela_para_enviar.items():
-                if info["next_hop"] != neighbor_address:
+
+                # Poison Reverse
+                # se aprendi via esse vizinho, anuncio como INFINITY
+                if info["next_hop"] == neighbor_address:
+                    tabela_filtrada[dest] = {
+                        "cost": INFINITY,
+                        "next_hop": info["next_hop"]
+                    }
+                else:
                     tabela_filtrada[dest] = info
 
             payload = {
@@ -173,8 +212,8 @@ class Router:
             try:
                 print(f"Enviando tabela para {neighbor_address}")
                 requests.post(url, json=payload, timeout=5)
-            except requests.exceptions.RequestException as e:
-                print(f"Erro ao conectar com {neighbor_address}: {e}")
+            except requests.exceptions.RequestException:
+                pass
 
 # --- API Endpoints ---
 # Instância do Flask e do Roteador (serão inicializadas no main)
@@ -224,12 +263,22 @@ def receive_update():
             continue
 
         neighbor_cost = info["cost"]
-        new_cost = link_cost + neighbor_cost
+
+        if neighbor_cost >= INFINITY:
+            # Se eu usava esse vizinho, marco como inalcançável
+            if network in router_instance.routing_table and \
+                router_instance.routing_table[network]["next_hop"] == sender_address:
+                router_instance.routing_table[network]["cost"] = INFINITY
+                updated = True
+            continue
+
+        new_cost = min(link_cost + neighbor_cost, INFINITY)
 
         if network not in router_instance.routing_table:
             router_instance.routing_table[network] = {
                 "cost": new_cost,
-                "next_hop": sender_address
+                "next_hop": sender_address,
+                "timestamp": time.time()
             }
             updated = True
 
@@ -240,7 +289,8 @@ def receive_update():
             if new_cost < current_cost:
                 router_instance.routing_table[network] = {
                     "cost": new_cost,
-                    "next_hop": sender_address
+                    "next_hop": sender_address,
+                    "timestamp": time.time()
                 }
                 updated = True
 
