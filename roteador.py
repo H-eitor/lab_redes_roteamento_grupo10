@@ -10,6 +10,7 @@ import requests
 from flask import Flask, jsonify, request
 
 INFINITY = 16
+ROUTE_TIMEOUT = 15
 
 def ip_to_int(ip_str):
     """Converte o ip em um inteiro de 32 bits"""
@@ -18,6 +19,7 @@ def ip_to_int(ip_str):
     
 def int_to_ip(ip_int):
     """Faz o caminho inverso, converte de inteiro para ip"""
+    ip_int &= 0xFFFFFFFF
     return f"{(ip_int >> 24) & 255}.{(ip_int >> 16) & 255}.{(ip_int >> 8) & 255}.{ip_int & 255}"
 
 def parse_network(network_str):
@@ -26,34 +28,41 @@ def parse_network(network_str):
     return ip_to_int(ip_part), int(prefix)
 
 def can_summarize(net1_str, net2_str):
-    """Verifica se duas redes são vizinhas e podem virar uma rede maior"""
     ip1, pref1 = parse_network(net1_str)
     ip2, pref2 = parse_network(net2_str)
 
-    # Verifia se as máscaras são iguais
-    if pref1 != pref2:
+    if pref1 != pref2 or pref1 <= 0:
         return False, None
-    
-    # Se o início de uma rede e o broadcast da outra forem contínuos, elas estão coladas 
-    mask = ((1 << 32) - 1) << (32 - pref1)
+
+    mask = ((1 << 32) - 1) << (32 - pref1) & 0xFFFFFFFF
     base1 = ip1 & mask
     base2 = ip2 & mask
 
-    if abs(base1 - base2) == (1 << (32 - pref1)):
-        new_prefix = pref1 - 1
-        new_base = min(base1, base2)
-        return True, f"{int_to_ip(new_base)}/{new_prefix}"
-    
-    return False, None
+    block = 1 << (32 - pref1)
+
+    # precisam ser adjacentes
+    if abs(base1 - base2) != block:
+        return False, None
+
+    new_prefix = pref1 - 1
+    super_block = 1 << (32 - new_prefix)
+
+    new_base = min(base1, base2)
+
+    # garante alinhamento da super-rede
+    if new_base % super_block != 0:
+        return False, None
+
+    return True, f"{int_to_ip(new_base)}/{new_prefix}"
 
 def summarize_routing_table(table):
     """Sumariza as rotas da tabela"""
 
     # Nada pra sumarizar
     if len(table) < 2:
-        return table
+        return {k: dict(v) for k, v in table.items()}
     
-    summary = table.copy()
+    summary = {k: dict(v) for k, v in table.items()}
 
     """Só sumariza rotas que vão para o mesmo vizinho"""
     by_neighbor = {}
@@ -62,9 +71,17 @@ def summarize_routing_table(table):
             continue
 
         hop = info['next_hop']
-        if hop not in by_neighbor:
-            by_neighbor[hop] = []
-        by_neighbor[hop].append(net)
+        if hop is None:
+            continue
+
+        if '/' in str(hop):
+            continue
+
+        cost = info.get('cost', 0)
+        if isinstance(cost, (int, float)) and cost >= 16:
+            continue
+
+        by_neighbor.setdefault(hop, []).append(net)
 
     for hop, nets in by_neighbor.items():
         nets.sort(key=lambda x: parse_network(x)[0])
@@ -75,24 +92,21 @@ def summarize_routing_table(table):
             # Verifica se é possível sumarizar
             can_merge, new_net = can_summarize(net1, net2)
 
-            if can_merge:
-                new_cost = max(summary[net1]['cost'], summary[net2]['cost'])
+            if not can_merge:
+                i += 1
+                continue
 
-                # Removemos as duas redes que foram 'fundidas'
-                if net1 in summary: del summary[net1]
-                if net2 in summary: del summary[net2]
+            new_cost = max(summary[net1]['cost'], summary[net2]['cost'])
 
-                # Adicionamos a nova super rrede
-                summary[new_net] = {'cost': new_cost, 'next_hop': hop, 'timestamp': time.time()}
+            del summary[net1]
+            del summary[net2]
+            summary[new_net] = {'cost': new_cost, 'next_hop': hop, "last_update": time.time()}
 
-                print(f"--- Sucesso: {net1} + {net2} viraram {new_net} ---")
+            print(f"--- Sucesso: {net1} + {net2} viraram {new_net} ---")
 
-                nets.pop(i) # Remove ne1
-                nets.pop(i) # Remove net2
-                nets.insert(i, new_net)
-        
-            else:
-                i+=1
+            nets.pop(i)
+            nets.pop(i)
+            nets.insert(i, new_net)
 
     return summary
 
@@ -118,19 +132,35 @@ class Router:
         self.update_interval = update_interval
 
         self.routing_table = {
-            self.my_network: {'cost': 0, 'next_hop': self.my_address, 'timestamp': time.time()}
+            self.my_network: {'cost': 0, 'next_hop': self.my_address, "last_update": time.time()}
         }
 
         # Adiciona vizinhos diretos conhecidos pelo arquivo CSV
         for neighbor, cost in self.neighbors.items():
             if neighbor not in self.routing_table:
-                self.routing_table[neighbor] = {'cost': cost, 'next_hop': neighbor, 'timestamp': time.time()}
+                self.routing_table[neighbor] = {'cost': cost, 'next_hop': neighbor, "last_update": time.time()}
 
         print("Tabela de roteamento inicial:")
         print(json.dumps(self.routing_table, indent=4))
 
         # Inicia o processo de atualização periódica em uma thread separada
         self._start_periodic_updates()
+
+    def expire_routes(self):
+        now = time.time()
+
+        for dest, info in self.routing_table.items():
+
+            if dest == self.my_network:
+                continue
+
+            last = info.get("last_update")
+            if last is None:
+                continue
+
+            if now - last > ROUTE_TIMEOUT and info["cost"] < INFINITY:
+                print(f"ROTA EXPIRADA: {dest}")
+                info["cost"] = INFINITY 
 
     def _start_periodic_updates(self):
         """Inicia uma thread para enviar atualizações periodicamente."""
@@ -144,44 +174,15 @@ class Router:
             time.sleep(self.update_interval)
             print(f"[{time.ctime()}] Enviando atualizações periódicas para os vizinhos...")
             try:
+                self.expire_routes()
                 self.send_updates_to_neighbors()
             except Exception as e:
-                print(f"Erro durante a atualização periódida: {e}") 
-
-    def _check_timeouts(self):
-        TIMEOUT = self.update_interval * 4
-
-        while True:
-            time.sleep(1)
-            now = time.time()
-            changed = False
-
-            for dest in list(self.routing_table.keys()):
-
-                if dest == self.my_network:
-                    continue
-
-                ts = self.routing_table[dest].get("timestamp")
-                if ts is None:
-                    continue
-
-                if now - ts > TIMEOUT:
-                    if self.routing_table[dest]["cost"] != INFINITY:
-                        print(f"Timeout: {dest} ficou inalcançável")
-                        self.routing_table[dest]["cost"] = INFINITY
-                        changed = True
-
-            if changed:
-                print("Tabela após timeout:")
-                print(json.dumps(self.routing_table, indent=4))
-   
+                print(f"Erro durante a atualização periódida: {e}")   
     
     def send_updates_to_neighbors(self):
         """
-        Envia a tabela de roteamento para todos os vizinhos
-        com Split Horizon + Poison Reverse.
-        """
-    
+        Envia a tabela de roteamento (potencialmente sumarizada) para todos os vizinhos.
+        """      
         for neighbor_address in self.neighbors:
 
             tabela_para_enviar = summarize_routing_table(
@@ -191,9 +192,6 @@ class Router:
             tabela_filtrada = {}
 
             for dest, info in tabela_para_enviar.items():
-
-                # Poison Reverse
-                # se aprendi via esse vizinho, anuncio como INFINITY
                 if info["next_hop"] == neighbor_address:
                     tabela_filtrada[dest] = {
                         "cost": INFINITY,
@@ -254,7 +252,6 @@ def receive_update():
         return jsonify({"status": "ignored"}), 200
 
     link_cost = router_instance.neighbors[sender_address]
-
     updated = False
 
     for network, info in sender_table.items():
@@ -263,22 +260,13 @@ def receive_update():
             continue
 
         neighbor_cost = info["cost"]
-
-        if neighbor_cost >= INFINITY:
-            # Se eu usava esse vizinho, marco como inalcançável
-            if network in router_instance.routing_table and \
-                router_instance.routing_table[network]["next_hop"] == sender_address:
-                router_instance.routing_table[network]["cost"] = INFINITY
-                updated = True
-            continue
-
         new_cost = min(link_cost + neighbor_cost, INFINITY)
 
         if network not in router_instance.routing_table:
             router_instance.routing_table[network] = {
                 "cost": new_cost,
                 "next_hop": sender_address,
-                "timestamp": time.time()
+                "last_update": time.time()
             }
             updated = True
 
@@ -290,7 +278,7 @@ def receive_update():
                 router_instance.routing_table[network] = {
                     "cost": new_cost,
                     "next_hop": sender_address,
-                    "timestamp": time.time()
+                    "last_update": time.time()
                 }
                 updated = True
 
@@ -299,6 +287,9 @@ def receive_update():
                 updated = True
 
     if updated:
+        router_instance.routing_table = summarize_routing_table(
+        router_instance.routing_table
+        )
         print("Tabela de roteamento ATUALIZADA:")
         print(json.dumps(router_instance.routing_table, indent=4))
 
