@@ -67,11 +67,12 @@ def summarize_routing_table(table):
     """Só sumariza rotas que vão para o mesmo vizinho"""
     by_neighbor = {}
     for net, info in summary.items():
-        if '/' not in net:
+        if '/' not in str(net):
             continue
 
-        hop = info['next_hop']
-        if hop is None:
+        hop = info.get('next_hop')
+        cost = info.get('cost', INFINITY)
+        if hop is None or cost >= INFINITY:
             continue
 
         if '/' in str(hop):
@@ -161,13 +162,21 @@ class Router:
         while True:
             time.sleep(5)
             now = time.time()
-
+            to_delete = []
             for net, route in self.routing_table.items():
                 if net == self.my_network:
                     continue
 
                 if now - route["last_update"] > self.route_timeout:
                     route["cost"] = INFINITY
+                    route["last_update"] = now # Reseta o timer para a deleção
+                    print(f"--- Rota {net} expirou e foi marcada como INFINITY ---")
+                if route["cost"] >= INFINITY and (now - route["last_update"] > 30):
+                    to_delete.append(net)
+
+            for net in to_delete:
+                del self.routing_table[net]
+                print(f"--- Rota {net} removida da tabela (Garbage Collection) ---")
 
     def _start_periodic_updates(self):
         """Inicia uma thread para enviar atualizações periodicamente."""
@@ -199,10 +208,17 @@ class Router:
             for net, info in summarized.items():
 
                 # SPLIT HORIZON
+                #if info["next_hop"] == neighbor:
+                 #   continue
+                #Poison Reverse
                 if info["next_hop"] == neighbor:
-                    continue
+        
+                    poisoned_info = info.copy()
+                    poisoned_info["cost"] = INFINITY
+                    table_to_send[net] = poisoned_info
 
-                table_to_send[net] = info
+                else:
+                    table_to_send[net] = info
 
             payload = {
                 "sender_address": self.my_address,
@@ -263,6 +279,21 @@ def receive_update():
 
         if network == router_instance.my_network:
             continue
+   
+        try:
+            if '/' in network and '/' in router_instance.my_network:
+                my_net_ip, my_net_pref = parse_network(router_instance.my_network)
+                rx_net_ip, rx_net_pref = parse_network(network)
+                
+                # Se a rede recebida (rx) tem máscara menor (é mais genérica)
+                if rx_net_pref < my_net_pref:
+                    mask = ((1 << 32) - 1) << (32 - rx_net_pref) & 0xFFFFFFFF
+                    # Se a minha rede está contida na rede recebida, eu ignoro para evitar loop
+                    if (my_net_ip & mask) == (rx_net_ip & mask):
+                        print(f"--- [AVISO] Ignorando sumarização {network} que engloba minha rede local ---")
+                        continue
+        except Exception as e:
+            print(f"Erro ao validar prefixo: {e}")
 
         neighbor_cost = info["cost"]
         new_cost = link_cost + neighbor_cost
