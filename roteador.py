@@ -130,7 +130,7 @@ class Router:
         self.neighbors = neighbors
         self.my_network = my_network
         self.update_interval = update_interval
-        self.route_timeout = 90
+        self.route_timeout = 20
 
         self.routing_table = {
             self.my_network: {'cost': 0,
@@ -162,12 +162,23 @@ class Router:
             time.sleep(5)
             now = time.time()
 
+            expired_neighbors = []
+
             for net, route in self.routing_table.items():
                 if net == self.my_network:
                     continue
 
                 if now - route["last_update"] > self.route_timeout:
-                    route["cost"] = INFINITY
+                    expired_neighbors.append(net)
+            
+            for neighbor in expired_neighbors:
+                del self.routing_table[neighbor]
+
+                for net, route in list(self.routing_table.items()):
+                    if route["next_hop"] == neighbor:
+                        route["cost"] = INFINITY
+                        route["next_hop"] = None
+                        route["last_update"] = now
 
     def _start_periodic_updates(self):
         """Inicia uma thread para enviar atualizações periodicamente."""
@@ -197,12 +208,16 @@ class Router:
             table_to_send = {}
 
             for net, info in summarized.items():
-
-                # SPLIT HORIZON
+                
+                # Poisoned Reverse
                 if info["next_hop"] == neighbor:
-                    continue
-
-                table_to_send[net] = info
+                    table_to_send[net] = {
+                        "cost": INFINITY,
+                        "next_hop": info["next_hop"],
+                        "last_update": info.get("last_update", time.time())
+                    }
+                else:
+                    table_to_send[net] = info
 
             payload = {
                 "sender_address": self.my_address,
