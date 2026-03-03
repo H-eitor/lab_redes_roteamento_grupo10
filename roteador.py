@@ -116,7 +116,7 @@ class Router:
     Representa um roteador que executa o algoritmo de Vetor de Distância.
     """
 
-    def __init__(self, my_address, neighbors, my_network, update_interval=1):
+    def __init__(self, my_address, neighbors, my_network, update_interval=2):
         """
         Inicializa o roteador.
 
@@ -131,7 +131,7 @@ class Router:
         self.neighbors = neighbors
         self.my_network = my_network
         self.update_interval = update_interval
-        self.route_timeout = 90
+        self.route_timeout = 300
 
         self.routing_table = {
             self.my_network: {'cost': 0,
@@ -211,14 +211,14 @@ class Router:
                 #if info["next_hop"] == neighbor:
                  #   continue
                 #Poison Reverse
-                if info["next_hop"] == neighbor:
-        
-                    poisoned_info = info.copy()
-                    poisoned_info["cost"] = INFINITY
-                    table_to_send[net] = poisoned_info
+                #if info["next_hop"] == neighbor:
+                #    continue
+                    #poisoned_info = info.copy()
+                    #poisoned_info["cost"] = INFINITY
+                    #table_to_send[net] = poisoned_info
 
-                else:
-                    table_to_send[net] = info
+                #else:
+                table_to_send[net] = info
 
             payload = {
                 "sender_address": self.my_address,
@@ -298,7 +298,7 @@ def receive_update():
         neighbor_cost = info["cost"]
         new_cost = link_cost + neighbor_cost
 
-        if neighbor_cost >= INFINITY:
+        if neighbor_cost > INFINITY:
             new_cost = INFINITY
 
         current_route = router_instance.routing_table.get(network)
